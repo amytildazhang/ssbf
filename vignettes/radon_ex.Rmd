@@ -1,0 +1,297 @@
+---
+title: "Example: Radon"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{radon_ex}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>"
+)
+options(rmarkdown.html_vignette.check_title = FALSE)
+```
+
+```{r setup}
+library(rstanarm)
+library(ssbf)
+library(annoshiny)
+library(tidyverse)
+```
+
+
+NEED TO MOVE THIS OUT OF THIS PACKAGE. But for now load slice, then annoshiny
+
+```{r}
+contrasts_for_pooling <- function(df) {
+    categorical_mask <- purrr::map_lgl(df, ~is.character(.) | is.factor(.))
+    categorical_names <- colnames(df)[categorical_mask]
+    purrr::map(categorical_names, ~stats::contrasts(df[[.]], contrasts=F)) %>%
+        purrr::set_names(categorical_names)
+}
+radon_v <- function(rstfit, X) {
+    samps <- rstan::extract(rstfit$stanfit)
+    sigs <- list("sigma2" = mean(samps$theta_L), "tau2" = mean(samps$aux)^2)
+    
+    cty_mask <- str_detect(colnames(X), "county")
+    sigidiag <- rep(0, ncol((X)))
+    sigidiag[cty_mask] <- 1/sigs$sigma2
+    
+    siginv <- diag(sigidiag)
+
+    solve(t(X) %*% X/sigs$tau2 + siginv) %*% t(X)/sigs$tau2
+    
+    
+}
+
+
+radon_w <- function(rstfit, X) {
+    
+  X %*% radon_v(rstfit, X)  
+    
+}
+radon_add_relp <- function(df) {
+    df %>%
+        group_by(id__, q_county, q_floor) %>%
+        mutate(
+            relationship = case_when(
+                same_county & same_floor ~ "same cluster",
+                same_county ~ "same county",
+                same_floor ~ "same basemen",
+                T ~ "different county and basement"
+            ),
+            sign = sign(val),
+            q_n = length(unique(q_id))
+        ) %>% ungroup()
+}
+
+
+radon_add_summaries <- function(relpdf) {
+    relpdf %>%
+        group_by(id__) %>% 
+        mutate(
+            ssbf = sum(val[relationship != "same cluster"]^2),
+            weight_ratio = val/mean(val[relationship == "same cluster"]),
+            pf = sum(val[relationship != "same cluster"])
+            
+        ) %>%
+        ungroup()
+    
+}
+
+radon_total_bsize <- function(df) {
+    df  %>%
+        group_by(p_county, p_floor) %>%
+        mutate(p_n = length(unique(id__))) %>% 
+        ungroup()
+}
+
+
+
+
+radon_weight_ptbypt <- function(slice) {
+    slice$factor_df() %>% 
+        radon_add_relp() %>%
+        radon_add_summaries() %>%
+        radon_total_bsize() %>%
+        dplyr::select(-rowname, -colname, -id__, 
+               -ends_with("_y"), -starts_with("same_"),
+               -starts_with("similar_")) %>%
+        unique()
+}
+
+radon_label_basement <- function(df) {
+    # must have p_floor
+    df %>% 
+        mutate(
+            basement = case_when(p_floor == 0 ~ "B) No basement",
+                                 p_floor == 1 ~ "A) Has basement")
+        ) 
+}
+
+radon_label_sign <- function(df) {
+    df %>% mutate(
+        sign = case_when(sign < 0 ~ "neg", T ~ "pos") %>%
+            factor(ordered = T, levels = c("pos", "neg"))
+    )
+}
+
+summarise_weights <- function(grpeddf) {
+   grpeddf %>% summarise(
+            mean_val = mean(val), 
+            q_n = length(unique(q_id)), 
+            ratio = mean(weight_ratio),
+            total = sum(val), 
+            unique_signs = length(unique(sign(val))),
+            n_pos = sum(val >= 0),
+            n_neg = sum(val < 0),
+            pssbf = sum(val^2)
+        ) 
+}
+ 
+radon_summarise_ptbypt <- function(ptbypt) {
+    ptbypt %>%
+        radon_label_basement() %>%
+        radon_label_sign() %>%
+        group_by_at(vars(starts_with("p_"), pf, relationship, sign, basement, ssbf)) %>%
+       summarise_weights()
+}
+
+```
+
+# Data
+
+Description of data and model
+
+
+
+```{r mod3wts}
+
+set.seed(29873)
+radonfit3 <- rstanarm::stan_glmer(
+    log_radon ~ floor + log_uranium + (1|county), 
+    data = rstanarm::radon, refresh = 0
+)
+radon_dat <- mutate(rstanarm::radon, county = factor(county))
+X3 <- model.matrix(~floor + log_uranium + county, 
+                  data = radon_dat,
+                  contrasts = contrasts_for_pooling(radon_dat))
+
+W <- radon_w(radonfit3, X3[,-3])
+slice_mod3_post <- slice::BasicSlice$new(
+    dplyr::select(radon_dat, -log_radon) %>% mutate(floor = factor(floor)),
+    W, y = as.vector(radon_dat$log_radon), 
+    yhat = as.vector(W %*% radon_dat$log_radon)
+)
+
+
+```
+
+
+# Generate plots
+
+## Define relationship groups
+```{r}
+ptbypt_3 <- radon_weight_ptbypt(slice_mod3_post)
+
+```
+
+
+## Determine quantities to plot
+
+
+```{r}
+indvwt_3 <- radon_summarise_ptbypt(ptbypt_3)
+
+pdf <- select(
+  ungroup(indvwt_3), 
+  
+  p_county, p_log_uranium, basement, relationship, ssbf, total, pf, p_n, q_n, ratio) %>%
+  filter(str_detect(relationship, "same"))
+```
+
+
+## Define base plots and annotation functions
+
+```{r}
+p_borrowersize <- ggplot(indvwt_3, aes(x = p_n, y = ssbf)) + 
+  geom_point() +
+  scale_x_continuous(trans = 'log')
+  
+af_highlightred <- function(plots, pointdf) {
+    purrr::map(plots, ~. + geom_point(data = pointdf, color = 'red') )
+}
+
+# Take a random subset of points
+selected_points <- sample(1:nrow(radon_dat), 3)
+pointdf <- select(ungroup(indvwt_3), basement, p_county, ssbf, p_n) %>%
+  unique() %>%
+  filter(1:n() %in% sample(1:n(), 3))
+  
+af_highlightred(list(p_borrowersize), pointdf)
+
+
+ap_pn <- annoplot(
+  # required
+  p_borrowersize, 
+  select(pdf, p_county, p_log_uranium, basement, ssbf, p_n),
+  af_highlightred,
+  # extra
+  hover = c("p_county", "basement", "p_log_uranium"), dims = list(c(1, 1)
+))
+```
+
+
+```{r}
+p_lendersize <- ggplot(indvwt_3, aes(x = q_n, y = ssbf)) + 
+  geom_point() +
+  facet_grid(~relationship) +
+  scale_x_continuous(trans = 'log')
+  
+af_highlightred(
+  list(p_lendersize), 
+  pointdf %>% left_join(indvwt_3)
+)
+
+ap_qn <- annoplot(
+  p_lendersize,  
+  select(pdf, p_county, p_log_uranium, basement, relationship, ssbf, q_n),
+  af_highlightred,
+  hover = c("p_county", "basement", "p_log_uranium"), dims = list(c(1, 4)
+  
+))
+```
+
+
+
+
+```{r}
+grp_labels <- expression(b[kj],  b[k*minute~j], b[kj*minute])
+p_relps_base <- ggplot(pdf, aes(x = total, y = ssbf, color = relationship, shape = relationship)) +
+  facet_grid(~basement) +
+  scale_color_manual(
+    values = c("black", RColorBrewer::brewer.pal(3, "Dark2")),
+    labels = grp_labels
+  ) +
+  scale_shape_manual(values = c(19, 17, 15), labels = grp_labels) +
+  theme_bw() +
+  labs(x = "Total weight", y = "SSBF", color = NULL, shape = NULL)
+
+
+
+ap_relps <- annoplot_fade(p_relps_base, geom_point, pdf, dims = list(c(1, 2)))
+```
+
+
+
+```{r}
+p_relps_ratio <- ggplot(pdf, aes(x = ratio, y = ssbf, color = relationship, shape = relationship)) +
+  facet_grid(~basement) +
+  scale_color_manual(
+    values = c("black", RColorBrewer::brewer.pal(3, "Dark2")),
+    labels = grp_labels
+  ) +
+  scale_shape_manual(values = c(19, 17, 15), labels = grp_labels) +
+  theme_bw() +
+  labs(x = "Total weight", y = "SSBF", color = NULL, shape = NULL)
+
+ap_relps_ratio <- annoplot_fade(p_relps_ratio, geom_point, pdf, dims = list(c(1, 2)))
+```
+
+
+
+# Run Shiny app
+
+
+
+```{r, eval = F}
+sso <- SLICE_app$new(pdf,
+                 factorplots = list(ap_relps, ap_relps_ratio),
+                 sideplots = list(ap_pn),
+                 errorplots = list(ap_qn))
+launch(sso)
+```
+
